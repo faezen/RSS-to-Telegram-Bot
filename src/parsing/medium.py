@@ -1,3 +1,19 @@
+#  RSS to Telegram Bot
+#  Copyright (C) 2021-2024  Rongrong <i@rong.moe>
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU Affero General Public License as
+#  published by the Free Software Foundation, either version 3 of the
+#  License, or (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU Affero General Public License for more details.
+#
+#  You should have received a copy of the GNU Affero General Public License
+#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 from __future__ import annotations
 from typing import Optional, Union
 from typing_extensions import Final
@@ -18,11 +34,14 @@ from .. import env, log, web, locks
 from .html_node import Code, Link, Br, Text, HtmlTree
 from .utils import isAbsoluteHttpLink
 from ..errors_collection import InvalidMediaErrors, ExternalMediaFetchFailedErrors, UserBlockedErrors
+from ..web.media import construct_weserv_url_convert_to_2560, construct_weserv_url_convert_to_jpg, \
+    insert_image_relay_into_weserv_url, detect_image_dimension_via_weserv
 
 logger = log.getLogger('RSStT.medium')
 
+# TODO: separate quirks into another module
 sinaimg_sizes: Final = ('large', 'mw2048', 'mw1024', 'mw720', 'middle')
-sinaimg_size_parser: Final = re.compile(r'(?P<domain>^https?://wx\d\.sinaimg\.\w+/)'
+sinaimg_size_parser: Final = re.compile(r'(?P<domain>^https?://(wx|tvax?)\d\.sinaimg\.\w+/)'
                                         r'(?P<size>\w+)'
                                         r'(?P<filename>/\w+\.\w+$)').match
 pixiv_sizes: Final = ('original', 'master')
@@ -41,7 +60,14 @@ lizhi_parser: Final = re.compile(r'(?P<url_prefix>^https?://cdn)'
                                  r'(?P<server_id>[125]?)'
                                  r'(?P<url_infix>\.lizhi\.fm/[\w/]+)'
                                  r'(?P<size_suffix>([uh]d\.mp3|sd\.m4a)$)').match
-isTelegramCannotFetch: Final = re.compile(r'^https?://(\w+\.)?telesco\.pe').match
+# Telegram DC can never fetch resources from these domain(s) directly.
+# Send via IMAGE_RELAY_SERVER.
+mustRelay: Final = re.compile(r'^https?://(\w+\.)?telesco\.pe').match
+# Telegram DC can sometimes fetch mismatched resources from these domain(s).
+# Send via weserv to ensure the fetched media is in the desired format.
+# However, these domain(s) are dramatically listed in the blocklist of weserv,
+# so we had to wrap them with IMAGE_RELAY_SERVER.
+mustWeservViaRelay: Final = re.compile(r'^https?://(\w+\.)?img\.alicdn\.com').match
 
 IMAGE: Final = 'image'
 VIDEO: Final = 'video'
@@ -64,9 +90,7 @@ MEDIA_MAX_SIZE: Final = 20971520
 
 # Note:
 # One message can have 10 media at most, but there are some exceptions.
-# 1. A GIF (Animation) and WEBP (sent as a file) must occupy a SINGLE message.
-#   1a. A WEBP sent as a file will be shown just like a sticker.
-#   1b. Since some time in 2022, Telegram DC will convert any WEBP sent as an image to a JPG. Before that, same as (1a).
+# 1. A GIF (Animation) and webp (although as a file) must occupy a SINGLE message.
 # 2. Videos and Images can be mixed in a media group, but any other type of media cannot be in the same message.
 # 3. Images uploaded as MessageMediaPhoto will be considered as an image. While MessageMediaDocument not, it's a file.
 # 4. Any other type of media except Image must be uploaded as MessageMediaDocument.
@@ -109,6 +133,10 @@ class AbstractMedium(ABC):
 
     @abstractmethod
     def type_fallback_chain(self) -> Optional[AbstractMedium]:
+        pass
+
+    @abstractmethod
+    def get_multimedia_html(self) -> Optional[str]:
         pass
 
     @abstractmethod
@@ -249,8 +277,8 @@ class Medium(AbstractMedium):
     def __init__(self, urls: Union[str, list[str]], type_fallback_urls: Optional[Union[str, list[str]]] = None):
         super().__init__()
         urls = urls if isinstance(urls, list) else [urls]
-        # dedup, should not use a set because sequence is important
-        self.urls: list[str] = sorted(set(urls), key=urls.index)
+        # dedup while keeping the order
+        self.urls: list[str] = list(dict.fromkeys(urls))
         self.original_urls: tuple[str, ...] = tuple(self.urls)
         self.chosen_url: Optional[str] = self.urls[0]
         self._server_change_count: int = 0
@@ -275,6 +303,12 @@ class Medium(AbstractMedium):
              if self.need_type_fallback and self.type_fallback_medium is not None
              else None)
         ) if not self.drop_silently else None
+
+    def get_multimedia_html(self) -> str:
+        url = self.original_urls[0]
+        if isAbsoluteHttpLink(url):
+            return f'<a href="{url}">{self.type}</a>'
+        return f'{self.type} (<code>{url}</code>)'
 
     def get_link_html_node(self) -> Text:
         url = self.original_urls[0]
@@ -325,13 +359,20 @@ class Medium(AbstractMedium):
                     return True
                 medium_info = await web.get_medium_info(url)
                 if medium_info is None:
-                    if url.startswith(env.IMAGES_WESERV_NL) or url.startswith(env.IMG_RELAY_SERVER):
-                        invalid_reasons.append('fetch failed')
+                    if url.startswith(env.IMG_RELAY_SERVER):
+                        invalid_reasons.append('relayed image fetch failed')
                         continue
-                    medium_info = await web.get_medium_info(env.IMG_RELAY_SERVER + url)
-                    if medium_info is None:
-                        invalid_reasons.append('both original and relayed image fetch failed')
-                        continue
+                    elif url.startswith(env.IMAGES_WESERV_NL):
+                        url = insert_image_relay_into_weserv_url(url)
+                        medium_info = url and await web.get_medium_info(url)
+                        if medium_info is None:
+                            invalid_reasons.append('weserv fetch failed')
+                            continue
+                    else:
+                        medium_info = await web.get_medium_info(env.IMG_RELAY_SERVER + url)
+                        if medium_info is None:
+                            invalid_reasons.append('both original and relayed image fetch failed')
+                            continue
                 self.size, self.width, self.height, self.content_type = medium_info
                 if self.type == IMAGE and self.size <= self.maxSize and min(self.width, self.height) == -1 \
                         and self.content_type and self.content_type.startswith('image') \
@@ -348,14 +389,14 @@ class Medium(AbstractMedium):
                         self.valid = False
                         self.drop_silently = True
                         return False
-                    # force convert SVG to PNG
+                    # force convert WEBP/SVG to PNG
                     if (
                             self.content_type
-                            and any(keyword in self.content_type for keyword in ('svg', 'application'))
+                            and any(keyword in self.content_type for keyword in ('webp', 'svg', 'application'))
                     ):
                         # immediately fall back to 'wsrv.nl'
                         self.urls = [url for url in self.urls if url.startswith(env.IMAGES_WESERV_NL)]
-                        invalid_reasons.append('force convert SVG to PNG')
+                        invalid_reasons.append('force convert WEBP/SVG to PNG')
                         continue
                     # always invalid
                     if self.width + self.height > 10000:
@@ -397,7 +438,7 @@ class Medium(AbstractMedium):
                     if flush:
                         flushed_log()
                     self._server_change_count = 0
-                    if isTelegramCannotFetch(self.chosen_url):
+                    if mustRelay(self.chosen_url):
                         await self.change_server()
                     return True
 
@@ -463,13 +504,18 @@ class Medium(AbstractMedium):
             return False
         self._server_change_count += 1
         self.chosen_url = env.IMG_RELAY_SERVER + self.chosen_url
-        if not env.TRAFFIC_SAVING:
-            # noinspection PyBroadException
-            try:
-                await web.get(url=self.chosen_url, semaphore=False, max_size=0)  # let the img relay sever cache the img
-            except Exception:
-                pass
+        await self._try_get_chosen_url()  # let the relay sever cache it
         return True
+
+    async def _try_get_chosen_url(self) -> bool:
+        if env.TRAFFIC_SAVING:
+            return True
+        # noinspection PyBroadException
+        try:
+            await web.get(url=self.chosen_url, semaphore=False, max_size=0)
+            return True
+        except Exception:
+            return False
 
     def __bool__(self):
         if self.valid is None:
@@ -529,34 +575,51 @@ class Image(Medium):
 
     def __init__(self, urls: Union[str, list[str]]):
         super().__init__(urls)
-        new_urls = []
+        new_urls_d = {}  # dict in Python 3.7+ is ordered
         for url in self.urls:
-            sinaimg_match = sinaimg_size_parser(url)
-            pixiv_match = pixiv_size_parser(url) if not sinaimg_match else None
-            if sinaimg_match:
-                parsed_sinaimg = sinaimg_match.groupdict()  # is a sinaimg img
+            if sinaimg_match := sinaimg_size_parser(url):
+                parsed_sinaimg = sinaimg_match.groupdict()
                 for size_name in sinaimg_sizes:
                     new_url = parsed_sinaimg['domain'] + size_name + parsed_sinaimg['filename']
-                    if new_url not in new_urls:
-                        new_urls.append(new_url)
-            elif pixiv_match:
-                parsed_pixiv = pixiv_match.groupdict()  # is a pixiv img
+                    new_urls_d[new_url] = None
+            elif pixiv_match := pixiv_size_parser(url):
+                parsed_pixiv = pixiv_match.groupdict()
                 for size_name in pixiv_sizes:
                     new_url = parsed_pixiv['url_prefix'] + size_name + parsed_pixiv['url_infix'] \
                               + parsed_pixiv['filename'] \
                               + ('_master1200.jpg' if size_name == 'master' else parsed_pixiv['file_ext'])
-                    if new_url not in new_urls:
-                        new_urls.append(new_url)
-            if url not in new_urls:
-                new_urls.append(url)
-        self.urls = new_urls
-        self.type_fallback_urls = new_urls.copy()
-        urls_not_weserv = [url for url in self.urls if not url.startswith(env.IMAGES_WESERV_NL)]
-        self.urls.extend(construct_weserv_url_convert_to_2560_png(urls_not_weserv[i])
-                         for i in range(min(len(urls_not_weserv), 3)))  # use for final fallback
-        self.chosen_url = self.urls[0]
+                    new_urls_d[new_url] = None
+            elif mustWeservViaRelay(url):
+                new_url = construct_weserv_url_convert_to_2560(f'{env.IMG_RELAY_SERVER}{url}')
+                new_urls_d[new_url] = None
+                # Fall through
+            new_urls_d[url] = None
+        self.type_fallback_urls = new_urls = list(new_urls_d)
+        # Construct up to three weserv URL as a last resort
+        for url, _ in zip(
+                filter(
+                    lambda u: not u.startswith(env.IMAGES_WESERV_NL),
+                    new_urls,
+                ),
+                range(3),
+        ):
+            new_urls_d[construct_weserv_url_convert_to_2560(url)] = None
+        self.urls = new_urls = list(new_urls_d)
+        self.chosen_url = new_urls[0]
+
+    def get_multimedia_html(self) -> str:
+        return f'<img src="{self.original_urls[0]}" />'
 
     async def change_server(self) -> bool:
+        if weserv_relayed := insert_image_relay_into_weserv_url(self.chosen_url):
+            # success if:
+            # 1. it is a weserv URL; and
+            # 2. it is called the first time.
+            # here we don't need to increase _server_change_count because the second call will just return None
+            self.chosen_url = weserv_relayed
+            await self._try_get_chosen_url()  # let the relay sever and weserv cache the image
+            return True
+
         sinaimg_server_match = sinaimg_server_parser(self.chosen_url)
         if not sinaimg_server_match:  # is not a sinaimg img
             return await super().change_server()
@@ -578,6 +641,9 @@ class Video(Medium):
     typeFallbackTo = Image
     typeFallbackAllowSelfUrls = False
     inputMediaExternalType = InputMediaDocumentExternal
+
+    def get_multimedia_html(self) -> str:
+        return f'<video src="{self.original_urls[0]}" />'
 
 
 class Audio(Medium):
@@ -634,10 +700,14 @@ class Animation(Image):
 class UploadedImage(AbstractMedium):
     type: str = IMAGE
 
-    def __init__(self, file: Union[bytes, BytesIO, Callable, Awaitable]):
+    def __init__(self, file: Union[bytes, BytesIO, Callable, Awaitable], file_name: str = None):
         super().__init__()
         self.file = file
+        self.file_name = file_name
         self.uploaded_file: Union[InputFile, InputFileBig, None] = None
+
+    def get_multimedia_html(self) -> None:
+        return None
 
     def telegramize(self) -> Optional[InputMediaUploadedPhoto]:
         if self.valid is None:
@@ -705,7 +775,7 @@ class UploadedImage(AbstractMedium):
                     raise ValueError(f'File must be bytes or BytesIO, got {type(self.file)}')
                 if isinstance(self.file, BytesIO):
                     self.file.seek(0)
-                self.uploaded_file = await env.bot.upload_file(self.file)
+                self.uploaded_file = await env.bot.upload_file(self.file, file_name=self.file_name)
                 if isinstance(self.file, BytesIO):
                     self.file.close()
                 self.valid = True
@@ -836,7 +906,8 @@ class Media:
 
         link_nodes: list[Text] = []
         for medium, medium_and_type in zip(self._media, media_and_types):
-            if isinstance(medium_and_type, Exception):
+            # Since Python 3.8, asyncio.CancelledError has been a subclass of BaseException rather than Exception
+            if isinstance(medium_and_type, (Exception, asyncio.CancelledError)):
                 if type(medium_and_type) in UserBlockedErrors:  # user blocked, let it go
                     raise medium_and_type
                 logger.debug('Upload media failed:', exc_info=medium_and_type)
@@ -863,14 +934,14 @@ class Media:
         ret = []
         allow_in_group = (
                 ((media,) if self.allow_mixing_images_and_videos and not self.consider_videos_as_gifs else (images,))
-                + (tuple() if self.consider_videos_as_gifs or self.allow_mixing_images_and_videos else (videos,))
+                + (() if self.consider_videos_as_gifs or self.allow_mixing_images_and_videos else (videos,))
                 + (audios,)
-                + ((files,) if self.allow_files_sent_as_album else tuple())
+                + ((files,) if self.allow_files_sent_as_album else ())
         )
         disallow_in_group = (
-                ((videos,) if self.consider_videos_as_gifs else tuple())
+                ((videos,) if self.consider_videos_as_gifs else ())
                 + (gifs,)
-                + (tuple() if self.allow_files_sent_as_album else (files,))
+                + (() if self.allow_files_sent_as_album else (files,))
         )
         for list_to_process in allow_in_group:
             while list_to_process:
@@ -945,55 +1016,3 @@ class Media:
     @property
     def hash(self):
         return '|'.join(medium.hash for medium in self._media)
-
-
-def weserv_param_encode(param: str) -> str:
-    hash_index = param.find('#')
-    if hash_index != -1:
-        param = param[:hash_index]  # remove fragment
-    # & will mess up the query string
-    # leaving % as is will let weserv decode the encoded character before requesting the source image
-    return param.replace('%', '%25').replace('&', '%26')
-
-
-def construct_weserv_url(url: str,
-                         width: Optional[int] = None,
-                         height: Optional[int] = None,
-                         fit: Optional[str] = None,
-                         output_format: Optional[str] = None,
-                         without_enlargement: Optional[bool] = None,
-                         default_image: Optional[str] = None) -> str:
-    return (
-            f'{env.IMAGES_WESERV_NL}?'
-            f'url={weserv_param_encode(url)}'
-            + (f'&w={width}' if width else '')
-            + (f'&h={height}' if height else '')
-            + (f'&fit={fit}' if fit else '')
-            + (f'&output={output_format}' if output_format else '')
-            + (f'&we=1' if without_enlargement else '')
-            + (f'&default={weserv_param_encode(default_image)}' if default_image else '')
-    )
-
-
-def construct_weserv_url_convert_to_2560_png(url: str) -> str:
-    return construct_weserv_url(
-        url,
-        width=2560,
-        height=2560,
-        fit='inside',
-        output_format='png',
-        without_enlargement=True
-    )
-
-
-def construct_weserv_url_convert_to_jpg(url: str) -> str:
-    return construct_weserv_url(url, output_format='jpg')
-
-
-async def detect_image_dimension_via_weserv(url: str) -> tuple[int, int]:
-    url = construct_weserv_url_convert_to_jpg(url)
-    res = await web.get_medium_info(url)
-    if not res:
-        return -1, -1
-    _, width, height, _ = res
-    return width, height
